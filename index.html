@@ -1584,6 +1584,7 @@ function waitForLibraries() {
         }, 10000);
     });
 }
+
 async function init() {
     try {
         await waitForLibraries();
@@ -1614,7 +1615,28 @@ async function init() {
         contentDisplay.addEventListener('input', handleDisplayEdit);
         topicInput.addEventListener('focus', () => switchView('input'));
         
-        topicInput.addEventListener('input', handleTopicInput);
+        topicInput.addEventListener('input', () => {
+			const text = topicInput.value;
+			
+			// 如果内容为空，恢复默认状态
+			if (!text.trim()) {
+				clearAiResults();
+				currentMarkdown = T('defaultMarkdown');
+				updateMarkmap(currentMarkdown);
+				updateAllButtonStates();
+				saveWorkspace();
+				return;
+			}
+			
+			if (text.trim().startsWith('#')) {
+				clearAiResults();
+				currentMarkdown = text;
+				debounceUpdate(currentMarkdown);
+			} else {
+				updateAllButtonStates();
+			}
+			saveWorkspace();
+		});
 
         document.addEventListener('fullscreenchange', handleFullScreenChange);
         document.addEventListener('webkitfullscreenchange', handleFullScreenChange);
@@ -1668,7 +1690,15 @@ async function init() {
         }
 
         handleModelChange();
-        clearContent();
+        
+        // 尝试加载保存的工作区
+        const workspaceLoaded = loadWorkspace();
+        
+        // 如果没有加载到工作区数据，显示默认内容
+        if (!workspaceLoaded) {
+            clearContent();
+        }
+        
         updateVersionCountDisplay();
 
         // 移动端初始化
@@ -1757,6 +1787,110 @@ function loadConfig() {
     } catch(e) {
         console.error("解析本地配置失败", e);
         localStorage.removeItem('ai-mindmap-config');
+    }
+}
+
+function saveWorkspace() {
+    try {
+        const workspace = {
+            topicInput: topicInput.value,
+            currentMarkdown: currentMarkdown,
+            aiResults: aiResults.map(r => ({ markdown: r.markdown })),
+            activeResultIndex: activeResultIndex,
+            currentViewMode: currentViewMode,
+            timestamp: Date.now()
+        };
+        localStorage.setItem('ai-mindmap-workspace', JSON.stringify(workspace));
+        console.log('工作区已保存');
+    } catch (e) {
+        console.error('保存工作区失败:', e);
+    }
+}
+
+function loadWorkspace() {
+    try {
+        const workspaceStr = localStorage.getItem('ai-mindmap-workspace');
+        if (!workspaceStr) {
+            console.log('没有找到保存的工作区');
+            return false;
+        }
+        
+        const workspace = JSON.parse(workspaceStr);
+        console.log('加载工作区:', workspace);
+        
+        // 检查是否是最近的数据（24小时内）
+        if (Date.now() - workspace.timestamp > 24 * 60 * 60 * 1000) {
+            console.log('工作区数据已过期');
+            localStorage.removeItem('ai-mindmap-workspace');
+            return false;
+        }
+        
+        // 如果工作区是空的（用户清空了内容），返回 false 显示默认内容
+        if (!workspace.topicInput && 
+            (!workspace.aiResults || workspace.aiResults.length === 0) &&
+            (!workspace.currentMarkdown || workspace.currentMarkdown === T('defaultMarkdown'))) {
+            console.log('工作区为空');
+            return false;
+        }
+        
+        // 恢复输入内容
+        if (workspace.topicInput) {
+            topicInput.value = workspace.topicInput;
+            console.log('已恢复输入内容');
+        }
+        
+        // 恢复 AI 生成结果
+        if (workspace.aiResults && workspace.aiResults.length > 0) {
+            console.log('正在恢复', workspace.aiResults.length, '个AI结果');
+            aiResults = workspace.aiResults.map(r => {
+                const { root } = transformer.transform(r.markdown);
+                return { markdown: r.markdown, root: root };
+            });
+            
+            if (workspace.currentMarkdown) {
+                currentMarkdown = workspace.currentMarkdown;
+            }
+            
+            // 恢复活动版本
+            const validIndex = workspace.activeResultIndex >= 0 && 
+                              workspace.activeResultIndex < aiResults.length 
+                              ? workspace.activeResultIndex 
+                              : 0;
+            
+            renderResultTabs();
+            switchToResult(validIndex);
+            
+            // 恢复视图模式
+            if (workspace.currentViewMode) {
+                currentViewMode = workspace.currentViewMode;
+                if (currentViewMode === 'original') {
+                    contentDisplay.value = topicInput.value;
+                    contentDisplay.style.display = 'block';
+                    topicInput.style.display = 'none';
+                } else if (currentViewMode === 'markdown') {
+                    contentDisplay.value = currentMarkdown;
+                    contentDisplay.style.display = 'block';
+                    topicInput.style.display = 'none';
+                }
+            }
+            
+            console.log('工作区恢复成功');
+            return true;
+        }
+        
+        // 如果只有 Markdown 但没有 AI 结果
+        if (workspace.currentMarkdown && workspace.currentMarkdown !== T('defaultMarkdown')) {
+            currentMarkdown = workspace.currentMarkdown;
+            updateMarkmap(currentMarkdown);
+            console.log('已恢复Markdown内容');
+            return true;
+        }
+        
+        return false;
+    } catch (e) {
+        console.error('加载工作区失败:', e);
+        localStorage.removeItem('ai-mindmap-workspace');
+        return false;
     }
 }
 
@@ -1961,6 +2095,8 @@ async function generateWithAI() {
             renderResultTabs();
             switchToResult(0);
             switchView('markdown');
+			
+			saveWorkspace();
 
             // 移动端自动跳转到导图面板
             if (window.innerWidth <= 768) {
@@ -1987,14 +2123,35 @@ async function generateWithAI() {
     }
 }
 
-function handleTopicInput() {
-    const text = this.value;
-    if (text.trim().startsWith('#')) {
-        clearAiResults();
-        currentMarkdown = text;
-        debounceUpdate(currentMarkdown);
-    } else {
+function handleDisplayEdit() {
+    if (currentViewMode === 'markdown') {
+        const newMarkdown = this.value;
+        currentMarkdown = newMarkdown;
+
+        if (activeResultIndex > -1 && aiResults[activeResultIndex]) {
+            aiResults[activeResultIndex].markdown = newMarkdown;
+            try {
+                const { root } = transformer.transform(newMarkdown);
+                aiResults[activeResultIndex].root = root;
+            } catch (error) {
+                console.error('Error parsing edited markdown:', error);
+            }
+        }
+        
+        debounceUpdate(newMarkdown);
+        saveWorkspace();
+    } else if (currentViewMode === 'original') {
+        topicInput.value = this.value;
+        
+        // 如果内容为空，恢复默认状态
+        if (!this.value.trim()) {
+            clearAiResults();
+            currentMarkdown = T('defaultMarkdown');
+            updateMarkmap(currentMarkdown);
+        }
+        
         updateAllButtonStates();
+        saveWorkspace();
     }
 }
 
@@ -2035,15 +2192,19 @@ function switchView(viewName) {
         topicInput.style.display = 'block';
     }
     updateAllButtonStates();
+    saveWorkspace();
 }
 
 function clearContent() {
     topicInput.value = '';
+    contentDisplay.value = '';
     clearAiResults();
     currentMarkdown = T('defaultMarkdown');
     updateMarkmap(currentMarkdown);
     switchView('input');
     topicInput.focus();
+    localStorage.removeItem('ai-mindmap-workspace');
+    saveWorkspace();  // 保存清空后的状态
 }
 
 function clearAiResults() {
@@ -2083,6 +2244,8 @@ function switchToResult(index) {
     document.querySelectorAll('.result-tab-btn').forEach(btn => {
         btn.classList.toggle('active', parseInt(btn.dataset.index) === index);
     });
+    
+    saveWorkspace();
 }
 
 function updateAllButtonStates() {
@@ -2390,6 +2553,7 @@ function saveNodeEdit() {
     }
 
     updateMarkmap(currentMarkdown);
+    saveWorkspace();
     closeEditModal();
 }
 
@@ -2438,6 +2602,7 @@ function deleteNode(nodeToDelete) {
     }
 
     updateMarkmap(currentMarkdown);
+    saveWorkspace();
 }
 
 
